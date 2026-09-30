@@ -1,205 +1,217 @@
-# Agentic AI Ebook — RAG Chatbot
+# agentic ai ebook rag chatbot
 
-A retrieval-augmented generation (RAG) chatbot that answers questions **only** from the
-[Konverge AI *Agentic AI* ebook](https://konverge.ai/pdf/Ebook-Agentic-AI.pdf).
-If the answer is not in the ebook, the chatbot says so.
+## about
 
-It ships with a React chat interface and a JSON API. Built for the AI Engineering Intern take-home
-assignment: **Python · LangGraph · Pinecone · FastAPI · React**, in roughly 250 lines of Python
-and 400 lines of JSX.
+This is a chatbot that answers questions about one specific book, the Konverge AI ebook on
+[Agentic AI](https://konverge.ai/pdf/Ebook-Agentic-AI.pdf). You ask a question in plain English
+and it replies using text pulled out of that PDF, then shows you which pages it used so you can
+check the answer yourself.
 
-![chat interface](docs/ui-chat.png)
+If the book does not cover what you asked, the chatbot says so instead of making something up.
 
-*An answerable question (retrieval score 0.81) and a question the ebook cannot answer (0.10, refused).*
+That is the whole point of the project. A normal chatbot can talk about agentic AI in general
+because it was trained on the internet. This one can only talk about what is actually written in
+these 60 pages, and it will tell you when it does not know.
+
+It was built as a take home assignment for an AI engineering internship. The brief asked for a
+RAG pipeline built with LangGraph and a vector database, a simple HTTP API, and answers that are
+strictly grounded in the source document. Everything here follows that brief and nothing more.
+
+**try it live:** https://agentic-ai-rag-chatbot-tc3p.onrender.com
+
+![the chat interface](docs/ui-chat.png)
+
+The screenshot shows the two things that matter. The first question is answered from the ebook
+with a retrieval score of 0.81. The second one, about the capital of France, scores 0.10, falls
+under the relevance threshold, and is refused without the language model ever being called.
 
 <p align="center">
-  <img src="docs/ui-home.png" width="700" alt="The landing screen, with sample questions to click">
+  <img src="docs/ui-home.png" width="700" alt="the landing screen with sample questions to click">
 </p>
 
-The landing screen offers six questions that are answerable from the ebook and two that should be
-refused, so the grounding behaviour can be checked in two clicks.
+On the landing screen there are six questions the book can answer and two it cannot, so you can
+see both behaviours without typing anything.
 
 ---
 
-## 1. What this project is
+## architecture
 
-The ebook is about *Agentic AI* — AI systems that can plan, use tools and act on their own.
-A normal LLM chatbot cannot answer questions about a specific 60-page PDF unless the whole
-document is pasted into the prompt, which is slow, expensive and imprecise.
+When someone asks a question, this is what happens:
 
-This project splits the PDF into small pieces, **embeds** each piece, stores those embeddings
-in **Pinecone**, and at question time fetches the few pieces closest to the user's question and
-gives only those to the LLM. The answer is therefore grounded in the ebook, and every answer
-comes back with the page numbers it was built from.
+```
+react ui (frontend/, port 5173 in dev)  or  curl / any http client
+  |
+  |  POST /chat  {"question": "what is a multi-agent system?"}
+  v
+fastapi  (app/main.py, port 8000)
+  |
+  v
+langgraph  (app/rag.py)          START
+  |
+  |---> retrieve ---> embed the question ---> pinecone, cosine similarity, top 4 chunks
+  |                            |
+  |                            +---> 4 chunks of the ebook, each with a similarity score
+  v
+  |---> generate ---> question + those 4 chunks ---> qwen 3.8 27b via groq
+  |                            |
+  |                            +---> a grounded answer                    END
+  v
+json: answer + confidence + sources (page, score, text)
+  |
+  v
+the ui draws the answer, the score, and a list of the source chunks you can expand
+```
+
+The same pipeline runs once at the start to build the index:
+
+```
+pdf url --> data/Ebook-Agentic-AI.pdf --> text extracted with pymupdf
+                                           |
+                                           v
+                            split into 113 chunks, about 1000 characters each
+                            with 150 characters of overlap
+                                           |
+                                           v
+                            embedded with minilm-l6-v2, 384 dimensions, on the cpu
+                                           |
+                                           v
+                                   pinecone index, cosine metric
+```
+
+In development Vite forwards `/chat` and `/health` to port 8000, so the browser only ever talks
+to one origin and there is no CORS configuration anywhere. In production FastAPI serves the built
+React app itself, so the whole thing runs on a single port.
 
 ---
 
-## 2. Architecture
+## how it works
 
-### At question time
+### embeddings in plain words
 
-```
-React UI (frontend/, port 5173 in dev)  ──or──  curl / any HTTP client
-  │  POST /chat  {"question": "What is a multi-agent system?"}
-  ▼
-FastAPI  (app/main.py, port 8000)
-  ▼
-LangGraph  (app/rag.py)          START
-  │
-  ├──► retrieve ──► embed the question ──► Pinecone (cosine similarity, top-4)
-  │                     │
-  │                     └──► 4 ebook chunks + similarity scores
-  ▼
-  └──► generate ───► question + those 4 chunks ──► Qwen 3.8 27B (via Groq)
-  │                     │
-  │                     └──► grounded answer  END
-  ▼
-JSON: answer + confidence + sources (page, score, text)
-  │
-  ▼
-UI renders the answer, the retrieval score, and a collapsible list of source chunks
-```
+An embedding is a list of 384 numbers that captures what a piece of text means. A model is
+trained so that texts with similar meanings end up pointing in roughly the same direction, and
+unrelated texts point in different directions. You can then compare two pieces of text just by
+measuring the angle between them.
 
-In development Vite proxies `/chat` and `/health` to port 8000, so the browser only ever talks to
-one origin and no CORS configuration is needed. In production FastAPI serves the built React app
-itself, so the whole thing runs on a single port.
+This is why keyword search is not enough. Somebody asking about "the cost of an agent" would not
+match a paragraph that says "how much does an agent cost", because the words barely overlap. The
+embeddings still find it, because the meanings are close.
 
-### At ingestion time (run once)
+### building the index
 
-```
-PDF URL ──► data/Ebook-Agentic-AI.pdf ──► PyMuPDF text extraction
-                                          ▼
-                             split into 113 chunks (~1000 chars, 150 overlap)
-                                          ▼
-                             MiniLM-L6-v2 embeddings (384-d, runs locally)
-                                          ▼
-                                   Pinecone index  (384-d, cosine)
-```
+1. Download the PDF and pull the text off each page with PyMuPDF.
+2. Slide a 1000 character window across each page, overlapping by 150 characters. That gives 113
+   chunks. The overlap exists so that a sentence sitting across a chunk boundary still appears
+   whole somewhere.
+3. Turn every chunk into a 384 number vector using a local sentence transformers model.
+4. Upload each vector to Pinecone, storing the text, the page number, and a chunk id as metadata.
+
+### answering a question
+
+1. Turn the question into a vector using the same model.
+2. Ask Pinecone for the 4 chunks whose vectors point closest to the question's.
+3. Build a prompt holding the system instructions, those 4 chunks with their page numbers, and the
+   question.
+4. Send that to the language model. It answers using nothing else.
+5. Return the answer, the chunks, and the similarity score of the best chunk.
+
+The important part is step 4. The model never sees the whole book. It sees four paragraphs. So it
+can only build its answer out of those paragraphs, and the API can show you exactly which ones.
 
 ---
 
-## 3. Tech stack
+## tech stack
 
-| Piece | Choice | Why |
+| part | choice | why |
 |---|---|---|
-| Language | Python 3.10+ | Required. |
-| API | **FastAPI** | ~60 lines, auto-generated `/docs`, easy to explain. |
-| Chat UI | **React 19 + Vite** | The assignment allows a React UI. No UI framework — plain components, plain CSS, no Tailwind, no component library. |
-| Orchestration | **LangGraph** | Required. Two nodes and three edges, so the workflow is fully visible. |
-| Vector DB | **Pinecone** (serverless, AWS `us-east-1`, cosine) | Required. Managed, free tier is enough for 113 vectors. |
-| Embeddings | **`sentence-transformers/all-MiniLM-L6-v2`** via `fastembed` (384-d, local) | Runs on CPU with no API key and no cost, and performs well on this corpus. |
-| LLM | **`qwen/qwen3.8-27b`** via **Groq** | Free tier, OpenAI-compatible API, fast inference, strong instruction following. |
-| PDF parsing | **PyMuPDF** | Fast, maintained, no external binaries. |
-| Config | `python-dotenv` | `.env` file. |
-| Tests | `pytest` + `httpx` | `TestClient`, no running server needed. |
+| language | Python 3.12 | the brief asked for Python |
+| API | FastAPI | about 60 lines, gives you `/docs` for free, easy to explain |
+| orchestration | LangGraph | the brief asked for it, and two nodes with three edges keeps the whole workflow visible |
+| vector database | Pinecone, serverless in `us-east-1`, cosine | the brief asked for it, and the free tier easily holds 113 vectors |
+| embeddings | `all-MiniLM-L6-v2` through `fastembed`, 384 dimensions, runs locally | no API key, no cost, nothing leaves the machine, and it performs well on this book |
+| language model | `qwen/qwen3.8-27b` through Groq | free tier, OpenAI compatible API, quick answers, follows instructions well |
+| pdf parsing | PyMuPDF | fast, maintained, no external binaries |
+| ui | React 19 with Vite | the brief allowed React. No UI framework, no component library, no styling library |
+| tests | pytest with httpx | `TestClient`, so no server has to be running |
 
-### Why these two providers
+### why these two providers
 
-**Groq for the LLM.** It exposes an OpenAI-compatible endpoint, so it is the *same*
-`openai` Python SDK with a different `base_url` — no extra dependency and no custom HTTP code.
-It is fast enough that the demo feels instant, and the free tier is enough for a reviewer to
-run the whole project without paying anything. `openai/gpt-oss-120b` is also available on the
-same account; set `GROQ_MODEL` in `.env` to switch. It is not the default because it is a
-reasoning model that spends output tokens on internal reasoning before answering.
+Groq exposes an OpenAI compatible endpoint, which means it is the same `openai` Python package
+with a different `base_url`. There is no extra dependency and no hand written HTTP calls. It is
+also fast, which makes the demo feel responsive, and the free tier is enough to run the whole
+project without spending anything.
 
-**Local embeddings via `fastembed`.** Groq does not serve an embeddings endpoint, and this
-project should not require a paid second provider just to embed 113 chunks. `fastembed` runs
-`all-MiniLM-L6-v2` through ONNX Runtime on the CPU: no API key, no cost, no network call, and
-nothing is sent off the machine. It is only ~90 MB and embeds the whole book in a few seconds.
-If you would rather use a hosted model, `app/embeddings.py` is the only file that changes — set
-`EMBEDDING_DIMENSIONS` in `app/config.py` to match and re-run `python scripts/ingest.py
---rebuild` so the index is recreated at the new size.
+`openai/gpt-oss-120b` is available on the same account if you want to try it, by setting
+`GROQ_MODEL`. It is not the default because it is a reasoning model that spends part of its
+output budget thinking before it replies.
 
-**No LangChain.** LangGraph is required and does not need LangChain. Calling the OpenAI and
-Pinecone SDKs directly keeps the retrieval step readable.
+Groq does not offer an embeddings endpoint, and I did not want to need a second paid provider
+just to embed 113 chunks. `fastembed` runs the MiniLM model through ONNX Runtime on the CPU, so
+embeddings are free, private, and need no key. The model is about 90 MB and embeds the entire
+book in a few seconds.
 
----
+If you would rather use a hosted embedding model, `app/embeddings.py` is the only file you need
+to change. Update `EMBEDDING_DIMENSIONS` in `app/config.py` to match, then run
+`python scripts/ingest.py --rebuild` so Pinecone builds the index at the new size.
 
-## 4. How RAG works
-
-### Embeddings, in one paragraph
-
-An **embedding** is a list of 384 numbers that represents the *meaning* of a piece of text.
-A model is trained so that texts with similar meanings end up as vectors pointing in a similar
-direction, and unrelated texts point in different directions. You can therefore compare two
-pieces of text by measuring the angle between their vectors — no keyword matching needed.
-This is why searching an embedding for *"cost of an agent"* can return a chunk that says
-*"how much does an agent cost?"* even though the words barely overlap.
-
-### Indexing (once, offline)
-
-1. Download the PDF and extract the text of each page with PyMuPDF.
-2. Slide a 1000-character window over each page, overlapping by 150 characters → 113 chunks.
-3. Embed every chunk → 113 vectors of 384 numbers.
-4. Upsert each vector into Pinecone with metadata: `text`, `page`, `chunk_id`.
-
-### Answering (per question)
-
-1. Embed the user's question → one vector.
-2. Ask Pinecone for the 4 chunks whose vectors are most similar (cosine similarity).
-3. Build a prompt: system instructions + those 4 chunks (each tagged with its page) + the question.
-4. The LLM answers using only that prompt.
-5. Return the answer, the chunks and the best similarity score.
-
-The key idea: **the LLM never sees the whole book, only the few relevant paragraphs**, so it
-can only ground its answer in those paragraphs, and the API can show you exactly which ones.
+LangChain is not used anywhere. The brief asked for LangGraph, LangGraph does not need LangChain,
+and calling the Pinecone and Groq SDKs directly keeps the retrieval step readable.
 
 ---
 
-## 5. Setup
+## setup
 
 ```bash
-git clone https://github.com/<your-username>/agentic-ai-rag-chatbot.git
-cd agentic-ai-rag-chatbot
+git clone https://github.com/rakesh0x/appenassign.git
+cd appenassign
 
 python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+source .venv/bin/activate          # on windows: .venv\Scripts\activate
 
 pip install -r requirements.txt
 
-cp .env.example .env               # then edit .env
+cp .env.example .env               # then open .env and fill it in
 ```
 
-The committed `frontend/dist` means the UI works without Node. To *develop* the UI you also need:
+You need three things in `.env`:
+
+| variable | where to get it |
+|---|---|
+| `PINECONE_API_KEY` | [app.pinecone.io](https://app.pinecone.io) then API Keys, then create a key. The free plan is plenty |
+| `PINECONE_INDEX_NAME` | any name you like. The ingestion script creates the index if it is missing. Default is `agentic-ai-ebook` |
+| `GROQ_API_KEY` | [console.groq.com/keys](https://console.groq.com/keys) then Create API Key. Free, and no card needed |
+| `GROQ_MODEL` | optional, defaults to `qwen/qwen3.8-27b` |
+
+You do not need an OpenAI key. Embeddings run locally and generation goes to Groq. The `.env`
+file is in `.gitignore`, so never commit real keys.
+
+The first time you ingest, the embedding model downloads once, about 90 MB, and then gets cached.
+
+### a note on the frontend
+
+`frontend/dist` is committed, so you can run the whole app with nothing but Python and you never
+have to touch Node. To work on the UI itself you also want:
 
 ```bash
 cd frontend
 npm install
 ```
 
-Requires Python 3.10+ and Node 18+.
-
-Fill in `.env`:
-
-| Variable | Where to get it |
-|---|---|
-| `PINECONE_API_KEY` | [app.pinecone.io](https://app.pinecone.io) → **API Keys** → create key. The free plan is enough. |
-| `PINECONE_INDEX_NAME` | Any name. The script creates the index if it is missing. Default `agentic-ai-ebook`. |
-| `GROQ_API_KEY` | [console.groq.com/keys](https://console.groq.com/keys) → **Create API Key**. Free, no card required. |
-| `GROQ_MODEL` | Optional. Defaults to `qwen/qwen3.8-27b`. |
-
-No OpenAI key is needed — embeddings are local and generation goes to Groq.
-`.env` is git-ignored; never commit real keys.
-
-The first ingestion downloads the MiniLM model (~90 MB) once and caches it.
+Python 3.10 or newer and Node 18 or newer.
 
 ---
 
-## 6. Ingest the PDF
+## ingest the pdf
 
 ```bash
 python scripts/ingest.py
 ```
 
-This script:
+The script downloads the PDF into `data/` unless it is already there, reads the text of each page
+with PyMuPDF, splits it into chunks of about 1000 characters with 150 characters of overlap,
+embeds every chunk locally, then creates the Pinecone index if needed and uploads all 113 chunks.
 
-1. downloads the PDF into `data/` (skipped if the file is already there),
-2. extracts text page by page with PyMuPDF,
-3. splits it into ~1000-character chunks with 150-character overlap,
-4. embeds every chunk locally with MiniLM-L6-v2,
-5. creates the Pinecone index if needed and upserts all 113 chunks.
-
-Expected output:
+You should see something like this:
 
 ```
 PDF already present: .../data/Ebook-Agentic-AI.pdf
@@ -209,126 +221,66 @@ Extracted 59 pages -> 113 chunks
 Done. 113 chunks are in Pinecone.
 ```
 
-Re-run at any time to rebuild:
+To start again from scratch, which also deletes the index first:
 
 ```bash
-python scripts/ingest.py --rebuild    # deletes the index first, then re-ingests
+python scripts/ingest.py --rebuild
 ```
+
+Run this again whenever you change the chunk size or swap the embedding model. The chat API only
+reads what is already sitting in Pinecone, it never ingests anything itself.
 
 ---
 
-## 7. Run the app
+## run it
 
-Two terminals.
+You need two terminals.
 
-**Terminal 1 — the Python backend:**
+Terminal one, the backend:
 
 ```bash
 uvicorn app.main:app --reload
 ```
 
-**Terminal 2 — the React UI:**
+Terminal two, the frontend:
 
 ```bash
 cd frontend
-npm install
 npm run dev
 ```
 
-Then open **<http://localhost:5173>**. The header badge shows **Backend online** once `/health`
-responds. If the backend is not running the badge turns red, the composer disables itself and
-tells you what to start; it re-enables automatically within five seconds of the backend coming
-back.
+Open **http://localhost:5173**. The badge in the top right says **Backend online** once the API
+answers. If the backend is not running the badge turns red, the input box disables itself, and it
+tells you what to start. It re enables itself within five seconds of the backend coming back, so
+you never have to reload the page.
 
-Other endpoints on the backend:
+There are two other endpoints worth knowing:
 
-- **<http://localhost:8000/docs>** — interactive Swagger UI for `POST /chat`
-- **<http://localhost:8000/health>** — `{"status": "ok"}`
+- **http://localhost:8000/docs** has a Swagger page where you can try `POST /chat` by hand
+- **http://localhost:8000/health** returns `{"status": "ok"}`
 
-### Single-port alternative
-
-To run the UI and the API from the Python process only, build the React app once:
+If you would rather run everything from one process, build the frontend once and then let
+FastAPI serve it:
 
 ```bash
 cd frontend && npm run build
 cd .. && uvicorn app.main:app
 ```
 
-FastAPI serves `frontend/dist` at `/`, so <http://localhost:8000> is the whole app on one port.
-The build output is committed, so this works on a fresh clone without installing Node at all —
-useful for a reviewer who only wants to run the Python side.
+Now **http://localhost:8000** is the entire app, UI and API together, on a single port.
 
 ---
 
-## 7b. Deploy to Render
+## example requests
 
-Render runs this as a **native Python service — no Dockerfile needed**, because `frontend/dist`
-is committed and FastAPI serves the UI from the same process. The repository already contains
-[`render.yaml`](render.yaml), which describes the service, and [`.python-version`](.python-version)
-pins Python 3.12.
-
-**One-time setup**
-
-1. Push the repo to GitHub.
-2. In Render: **New → Blueprint**, then pick the repository. Render reads `render.yaml`.
-3. Render will prompt for the two secrets it must not store in git. Paste them in the dashboard:
-
-   | Key | Value |
-   |---|---|
-   | `PINECONE_API_KEY` | your Pinecone key |
-   | `GROQ_API_KEY` | your Groq key |
-
-   `PINECONE_INDEX_NAME` and `GROQ_MODEL` are already set in the blueprint.
-4. Deploy. The build log should end with `Application startup complete`.
-
-Then open the `*.onrender.com` URL. `GET /health` is wired up as Render's health check, so the
-service is only marked live once the API answers.
-
-**What the deployed service does and does not do**
-
-- **No ingestion at deploy time.** The 113 chunks already live in the Pinecone index
-  `agentic-ai-ebook`. If you ever change the embedding model or the chunk size, re-run
-  `python scripts/ingest.py --rebuild` locally — the deploy only reads what is already in Pinecone.
-- **Memory.** The service needs roughly 300 MB of RAM after the first query, because the MiniLM
-  embedding model is loaded locally. Render's free tier has 512 MB, which fits with room to spare.
-- **The first request is slow.** The embedding model downloads (~90 MB) and loads on first use, so
-  the first answer can take 15–30 seconds. `/health` responds immediately.
-- **The free tier sleeps.** After ~15 minutes with no traffic Render stops the instance, and the
-  next request pays that cold start again. If you would rather it stay warm for a demo or an
-  interview, switch the plan to `starter` in `render.yaml` (or the Render dashboard) for $7/month.
-
-**Deploying from the command line instead**
-
-Render has no first-party CLI. Use the official API with a key from <https://api.render.com>:
-
-```bash
-curl -X POST https://api.render.com/v1/services \
-  -H "Authorization: Bearer $RENDER_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"agentic-ai-rag-chatbot","githubRepo":"<you>/<repo>"}'
-```
-
-Or use the community CLI, `render-cli`:
-
-```bash
-brew install cli/cli
-render services create --name agentic-ai-rag-chatbot --repo <you>/<repo>
-```
-
-Then set `PINECONE_API_KEY` and `GROQ_API_KEY` on the service and trigger a deploy.
-
----
-
-## 8. Example requests
-
-`GET /health`
+Health check:
 
 ```bash
 curl http://localhost:8000/health
 # {"status":"ok"}
 ```
 
-`POST /chat`
+A real question:
 
 ```bash
 curl -X POST http://localhost:8000/chat \
@@ -338,10 +290,10 @@ curl -X POST http://localhost:8000/chat \
 
 ```json
 {
-  "answer": "A Multi-Agent System (MAS) is an agentic system that shines in tasks requiring diverse feedback and parallel task execution. It allows for independent agent operation, facilitating dynamic task allocation and parallel processing. Agents in these systems can be organized into two main architectures: 1. Hierarchical: where an agent operates and communicates within a particular domain of influence. 2. Peer-to-peer: where an agent can talk to any other agent.",
-  "confidence": 0.8055,
+  "answer": "A Multi-Agent System (MAS) is an agentic system that shines in tasks requiring diverse feedback and parallel task execution. It allows for independent agent operation, facilitating dynamic task allocation and parallel processing. Agents in these systems can be organized into two main architectures: 1. Hierarchical, where an agent operates and communicates within a particular domain of influence. 2. Peer-to-peer, where an agent can talk to any other agent.",
+  "confidence": 0.8053,
   "sources": [
-    { "page": 31, "score": 0.8055, "text": "Multi Agentic systems could be organized into hierarchical ..." },
+    { "page": 31, "score": 0.8053, "text": "Multi Agentic systems could be organized into hierarchical ..." },
     { "page": 29, "score": 0.7521, "text": "In this section, we explore Multi-Agent Systems (MAS) and ..." },
     { "page": 30, "score": 0.7104, "text": "Agentic systems can be categorized into single and multi-agent systems (MAS) ..." },
     { "page": 34, "score": 0.6888, "text": "..." }
@@ -349,10 +301,11 @@ curl -X POST http://localhost:8000/chat \
 }
 ```
 
-The answer text and scores above are the real output of this pipeline. `text` is truncated here
-for readability; the API returns the full chunk.
+That answer and those scores are the real output of this pipeline running against the live
+deployment. The `text` values are shortened here to keep the example readable, the API returns
+the whole chunk.
 
-Python:
+In python:
 
 ```python
 import requests
@@ -370,23 +323,23 @@ for source in response["sources"]:
 
 ---
 
-## 9. Sample questions
+## sample questions
 
-Each of these was run against the live pipeline. The score is the real retrieval score, and the
-page is the real page the best chunk came from.
+Every question below was run against the deployed version. The score is the real retrieval score
+and the page is the real page the best matching chunk came from.
 
-| # | Question | Score | Cited page | In the ebook |
-|---|---|---|---|---|
-| 1 | What is Agentic AI? | 0.82 | p. 3 | Ch. 1, p. 8–11 |
-| 2 | How are AI agents different from traditional LLM applications? | 0.74 | p. 10 | Comparison table, p. 10–11 |
-| 3 | What are the core pillars of an agentic AI system, from perception to execution? | 0.77 | p. 19 | §2.1, p. 19–20 |
-| 4 | What is a multi-agent system and how can agents be organised? | 0.81 | p. 31 | Ch. 3, p. 30–31 |
-| 5 | What challenges arise when orchestrating complex agentic systems? | 0.71 | p. 39 | §3.4 / §4.1, p. 36, 39 |
-| 6 | How should an organisation assess its readiness for Agentic AI? | 0.81 | p. 48 | Ch. 5, p. 48–53 |
+| question | score | page | where it is in the book |
+|---|---|---|---|
+| What is Agentic AI? | 0.82 | 3 | chapter 1, pages 8 to 11 |
+| How are AI agents different from traditional LLM applications? | 0.74 | 10 | the comparison table on pages 10 and 11 |
+| What are the core pillars of an agentic AI system, from perception to execution? | 0.77 | 19 | section 2.1, pages 19 and 20 |
+| What is a multi-agent system and how can agents be organised? | 0.81 | 31 | chapter 3, pages 30 and 31 |
+| What challenges arise when orchestrating complex agentic systems? | 0.71 | 37 | sections 3.4 and 4.1, pages 36 and 39 |
+| How should an organisation assess its readiness for Agentic AI? | 0.81 | 48 | chapter 5, pages 48 to 53 |
 
-And questions that are correctly **refused**:
+And questions that get refused on purpose:
 
-| Question | Score | Answer |
+| question | score | what comes back |
 |---|---|---|
 | What is the capital of France? | 0.10 | refused |
 | Who won the 2018 FIFA World Cup? | 0.07 | refused |
@@ -394,262 +347,290 @@ And questions that are correctly **refused**:
 
 ---
 
-## 10. Grounding behaviour
+## how it stays grounded
 
-Two independent layers stop the chatbot from inventing content.
+Two separate things stop the chatbot from inventing content.
 
-**1. A retrieval threshold.** The ebook covers a narrow domain, and in-domain questions score far
-above out-of-domain ones. I measured this by embedding the 113 real chunks and comparing eight
-in-domain questions against eight unrelated ones:
+**A threshold on the retrieval score.** The book covers one narrow subject, so questions about it
+score far higher than questions about anything else. I measured this by embedding the 113 real
+chunks and comparing eight questions from inside the book against eight unrelated ones:
 
-| | best-match similarity |
+| | best match score |
 |---|---|
-| In-domain questions | **0.60 – 0.82** |
-| Unrelated questions | **0.07 – 0.18** |
+| questions about the book | 0.60 to 0.82 |
+| unrelated questions | 0.07 to 0.18 |
 
-`SIMILARITY_THRESHOLD = 0.40` in `app/rag.py` sits in that gap, so if the best retrieved chunk
-scores below it, the graph returns
+`SIMILARITY_THRESHOLD = 0.40` in `app/rag.py` sits in the gap between those two groups. If the
+best chunk scores under it, the graph returns
 
 ```
 I couldn't find this information in the provided ebook.
 ```
 
-and **the LLM is never called at all**. This is a cheap, explainable guard: no question, no LLM
-call, no chance of a confident guess. The three refused questions in section 9 score 0.07–0.10,
-which is a wide margin below 0.40.
+and the language model is never called at all. No request, no cost, no chance of a confident
+guess. The refused questions in the table above score between 0.07 and 0.10, which is a wide
+margin under the threshold.
 
-**2. The system prompt.** The prompt, shown in full in `app/rag.py`, instructs the model to use
-only the supplied context, to emit the exact "couldn't find" sentence when the context is
-insufficient, and not to guess or use outside knowledge. `temperature=0` keeps answers stable.
+**A system prompt that forbids guessing.** The prompt is written out in full in `app/rag.py`. It
+tells the model to use only the supplied context, to say the exact refusal sentence when the
+context does not contain the answer, and not to guess or reach for outside knowledge.
+`temperature=0` keeps the wording stable between runs.
 
-Together these mean a question like *"What is the capital of France?"* returns the refusal with
-a low score, rather than a fluent invention.
+On their own, the threshold stops most bad questions before they reach the model, and the prompt
+catches the rest.
 
-> **On the confidence value:** `confidence` is the **cosine similarity score of the
-> best-matching chunk** as reported by Pinecone. It is *not* a calibrated probability that the
-> answer is correct. A high score means "these chunks look like the question", not "this answer
-> is 81% right". Read it as a retrieval-quality indicator, next to the `sources` you can inspect
-> yourself. The UI labels it "Retrieval score" for the same reason.
+### what the confidence number actually means
+
+`confidence` is simply the cosine similarity of the best matching chunk, exactly as Pinecone
+reports it. It is **not** a probability that the answer is correct. A high score means these
+chunks look like a good match for your question, nothing more. Read it as an indicator of how
+good the retrieval was, and look at the `sources` beside it, which you can check yourself. That
+is also why the interface labels it "retrieval score" rather than "confidence".
 
 ---
 
-## 11. Project structure
+## project structure
 
 ```
-rag-chatbot/
-├── app/                          Python backend
-│   ├── __init__.py               empty, makes `app` a package
-│   ├── config.py                 environment variables and chunking constants
-│   ├── embeddings.py             the only place text is turned into vectors
-│   ├── vector_store.py           Pinecone: create index, upsert chunks, search chunks
-│   ├── rag.py                    the LangGraph (retrieve -> generate), the prompt, the threshold
-│   └── main.py                   FastAPI: /chat, /health, and serving the built UI at /
+appenassign/
+├── app/                            the python backend
+│   ├── __init__.py                 empty, makes app a package
+│   ├── config.py                   env variables and the chunking constants
+│   ├── embeddings.py               the only place text becomes a vector
+│   ├── vector_store.py             pinecone: create the index, upsert chunks, search chunks
+│   ├── rag.py                      the langgraph, the prompt and the threshold
+│   └── main.py                     fastapi: /chat, /health, and serving the built ui
 │
-├── frontend/                     React UI (Vite)
+├── frontend/                       the react ui
 │   ├── src/
-│   │   ├── App.jsx               page state: messages, draft, pending, backend health
-│   │   ├── api.js                the only file that calls the backend
-│   │   ├── constants.js          the sample questions shown on the landing screen
-│   │   ├── index.css             all styling, plain CSS with custom properties
+│   │   ├── App.jsx                 holds the messages, the draft and the backend health
+│   │   ├── api.js                  the only file that talks to the backend
+│   │   ├── constants.js            the sample questions on the landing screen
+│   │   ├── index.css               all the styling, plain css
 │   │   └── components/
-│   │       ├── Message.jsx       one chat bubble: answer, retrieval score, source chunks
-│   │       └── Composer.jsx      the textarea and send button
-│   ├── vite.config.js            dev server + proxy of /chat and /health to :8000
+│   │       ├── Message.jsx         one bubble: answer, score, source chunks
+│   │       └── Composer.jsx        the text box and the send button
+│   ├── vite.config.js              dev server, and the proxy to port 8000
 │   ├── index.html
-│   └── dist/                     build output, committed so the UI runs without Node
+│   └── dist/                       the build, committed so the ui runs without node
 │
 ├── scripts/
-│   └── ingest.py                 one-off: download PDF -> chunks -> embeddings -> Pinecone
+│   └── ingest.py                   pdf to chunks to vectors to pinecone, run once
 ├── tests/
-│   └── test_api.py               six small tests, two of which need a live index
-├── docs/                         screenshots used in this README
-├── data/                         where the downloaded PDF lands (git-ignored)
-├── .env.example                  template for the environment variables
+│   └── test_api.py                 six tests, two of which need a live index
+├── docs/                           the screenshots used in this readme
+├── data/                           where the pdf lands, git ignored
+├── .env.example                    template for the environment variables
 ├── .gitignore
-├── render.yaml                   Render service definition (native Python, no Dockerfile)
-├── .python-version               pins Python 3.12
-├── requirements.txt              pinned Python versions
-├── frontend/package.json         pinned JS versions
+├── render.yaml                     the render service definition
+├── .python-version                 pins python 3.12
+├── requirements.txt
 └── README.md
 ```
 
-Each file has one job. `app/rag.py` is the file to open first for the backend — it is the whole
-pipeline in about 80 lines. `frontend/src/api.js` is the file to open first for the UI — it is
-the entire network layer in 20 lines.
+Every file has one job. If you are reading the backend, start with `app/rag.py`, that is the whole
+pipeline in about 80 lines. If you are reading the frontend, start with `frontend/src/api.js`,
+that is the entire network layer in 37 lines.
 
----
+### about the frontend in a bit more detail
 
-## 12. Design decisions
-
-**Why it is this small.** The assignment is about showing that the RAG loop is understood, so
-every stage is a plain function you can read top to bottom. No classes beyond a `TypedDict`, no
-interfaces, no plugin registries.
-
-- **No LangChain.** LangGraph is required and sufficient; LangChain would add a large dependency
-  and hide the retrieval step behind abstractions.
-- **Direct SDK calls for Groq and Pinecone.** More code than the LangChain equivalents, but the
-  code shown *is* the code that runs.
-- **Local embeddings.** One provider instead of two, no key to manage, nothing leaves the
-  machine. The corpus is small enough that a 384-d MiniLM model is more than sufficient.
-- **Character-based chunking, not token-based.** Simpler to read and to explain, and fine for a
-  ~78,000-character document.
-- **Chunk per page, not across the whole document.** It keeps page numbers exact, so every source
-  in the response is a real page the reader can open. A sentence split across a page boundary is
-  a small, acceptable cost.
-- **Fixed threshold instead of a reranker.** Measured in-domain and out-of-domain scores separate
-  cleanly, so a reranker would add complexity for no measurable gain on this corpus.
-- **React for the UI, but nothing else.** No Tailwind, no component library, no state-management
-  library, no data-fetching library. The whole UI is `useState` plus two small components, and
-  `api.js` uses `fetch`. Every line in the frontend is readable in one sitting.
-- **`fetch` straight to `/chat`.** No generated client, no react-query. `api.js` is 20 lines and
-  the request and response shape match the FastAPI models exactly.
-- **In development, Vite proxies to the backend** instead of enabling CORS with wildcards. One
-  origin for the browser, no permissive CORS policy in the API.
-- **No conversation memory, auth, database or streaming.** Not required, and each would need a
-  paragraph of justification in an interview.
-- **No cache, retries or custom exception hierarchy.** Errors become plain HTTP status codes at
-  the API boundary and plain error bubbles in the UI.
-
-### Known limitations
-
-- Chunk size and threshold are tuned for this one 60-page ebook; a different corpus would need
-  them re-measured.
-- A question whose answer is in the ebook but phrased very differently may fall under the
-  threshold and be refused (false negative). Raising `TOP_K` lowers this at the cost of noise.
-- Retrieval is purely semantic, so a question that hinges on one specific table row or figure
-  can be missed. Hybrid keyword + vector search would help.
-- The `sources` list always shows the 4 retrieved chunks, even when the answer is a refusal —
-  useful for debugging, but it means a refusal still returns text.
-- No conversation memory, so follow-up questions like *"and what about healthcare?"* have no
-  context — the UI keeps a conversation on screen but the API is stateless.
-- Answers are not streamed. The whole reply appears at once after a typing indicator, which is
-  simpler than a streaming endpoint and enough for this document size.
-- No evaluation set. Answer quality is judged by reading, not measured against ground truth.
-
----
-
-## 12b. About the frontend
-
-| File | Lines | What it does |
+| file | lines | what it does |
 |---|---|---|
-| `frontend/src/App.jsx` | 163 | Holds `messages`, `draft`, `pending` and backend health in `useState`; calls `askQuestion`; renders the transcript and the landing screen. |
-| `frontend/src/api.js` | 37 | The only place that calls the backend. `POST /chat` and `GET /health`, safe JSON parsing, and the shared `SIMILARITY_THRESHOLD`. |
-| `frontend/src/constants.js` | 12 | The sample questions on the landing screen. |
-| `frontend/src/components/Message.jsx` | 76 | One chat bubble: the answer, a colour-coded retrieval score, and a collapsible `<details>` list of source chunks with page numbers. |
-| `frontend/src/components/Composer.jsx` | 41 | Textarea and Send button. Enter sends, Shift+Enter adds a newline. Shows an offline hint when the backend is down. |
-| `frontend/src/index.css` | 472 | All styling, plain CSS custom properties, no framework. |
-| `frontend/vite.config.js` | 13 | React plugin, port 5173, and the proxy of `/chat` and `/health` to port 8000. |
+| `src/App.jsx` | 163 | Keeps the messages, the draft, the loading flag and the backend health in `useState`, calls `askQuestion`, renders the transcript and the landing screen |
+| `src/api.js` | 37 | The only place that calls the backend. Safe json parsing, so an empty response never crashes the page |
+| `src/constants.js` | 12 | The sample questions |
+| `src/components/Message.jsx` | 76 | One bubble: the answer, a colour coded score, and a collapsible list of source chunks with page numbers |
+| `src/components/Composer.jsx` | 41 | Text box and send button. Enter sends, Shift and Enter makes a new line. Shows a hint when the backend is down |
+| `src/index.css` | 472 | All the styling. Plain css custom properties, no framework |
+| `vite.config.js` | 13 | The React plugin, port 5173, and the proxy for `/chat` and `/health` |
 
-Data flows one way: `App` owns the state, `Message` and `Composer` receive props and call back
-through props. There is no context, no store and no global object.
+Data only flows one way. `App` owns the state, and `Message` and `Composer` get props and call
+back through props. There is no context, no store and no global object.
 
-### How the UI handles a dead backend
-
-The backend can be stopped, restarted or simply not started yet, so the frontend treats it as a
-dependency that may be unavailable rather than assuming it is always there.
-
-- On mount, and every 5 seconds after that, `App` calls `GET /health`. The header badge shows
-  **Connecting → Backend online → Backend offline**, and the composer re-enables itself within
-  five seconds of the backend coming back. No page reload is needed.
-- While offline the composer is disabled and shows *"Start the backend with: uvicorn app.main:app
-  --reload"* instead of a dead input.
-- `api.js` never calls `response.json()` blindly. It reads the body as text first, so an empty or
-  non-JSON response — which is exactly what a stopped backend returns — produces the readable
-  message *"Cannot reach the backend…"* instead of a raw `Unexpected end of JSON input` browser
-  error.
-- A failed request only adds an error bubble. It never marks the whole backend offline, because
-  `/health` answering `ok` while Groq returns 502 means the API is up and the *upstream* is
-  failing — those are different problems.
+The backend can be down, restarting, or not started yet, so the frontend treats it as something
+that might not be there rather than assuming it always is. It checks `/health` on load and again
+every five seconds. While it is offline the input box is disabled and says how to start the
+backend. And `api.js` never calls `response.json()` blindly, it reads the body as text first, so
+an empty response from a stopped backend produces a readable message instead of a raw
+`Unexpected end of JSON input` error.
 
 ---
 
-## How to explain this project in an interview
+## design decisions
 
-**What is RAG?**
-Retrieval-Augmented Generation. Instead of asking a model to answer from memory, we first look up
-the relevant pieces of our document and paste them into the prompt. The model then answers from
-those pieces. It lets a general model answer about a specific document, and lets us show the
+**Why this is so small.** The point of the exercise is showing that the retrieval loop is
+understood, so every stage is a plain function you can read from top to bottom. No classes beyond
+one `TypedDict`, no interfaces, no plugin registries, no design patterns.
+
+- No LangChain. LangGraph is what the brief asked for and it does not need LangChain. Adding
+  LangChain would mean a large dependency and it would hide the retrieval step behind
+  abstractions.
+- Direct calls to the Pinecone and Groq SDKs. More code than the LangChain equivalents, but the
+  code you read is the code that runs.
+- Local embeddings. One provider instead of two, no key to manage, and nothing leaves the
+  machine. The book is small enough that a 384 dimension MiniLM model is more than enough.
+- Chunking by characters, not tokens. Easier to read and easier to explain, and fine for a
+  document of 78,000 characters.
+- Chunking per page rather than across the whole document. It keeps the page numbers exact, so
+  every source in the response is a real page you can open in the PDF. A sentence split across a
+  page boundary is a small cost and an acceptable one.
+- A fixed threshold instead of a reranker. In domain and out of domain scores separate cleanly on
+  this book, so a reranker would add complexity and measurably nothing here.
+- React for the ui and nothing else. No Tailwind, no component library, no data fetching library,
+  no state manager. It is `useState`, `fetch` and some jsx, all readable in one sitting.
+- The Vite dev server proxies to the backend rather than switching on permissive CORS. The browser
+  stays on one origin and the API needs no CORS configuration.
+- No conversation memory, no auth, no database, no streaming. None of them were asked for, and
+  each would need its own paragraph of justification in an interview.
+- No cache, no retries, no custom exception hierarchy. Errors become plain HTTP status codes at
+  the API boundary and plain red bubbles in the UI.
+
+### things i know are weak
+
+- The chunk size and the threshold are tuned for this one book. Another document would need both
+  re measured.
+- A question whose answer is in the book but worded very differently can fall under the
+  threshold and get refused. That is a false negative. Raising `TOP_K` helps at the cost of more
+  noise.
+- Retrieval is purely semantic. A question that hinges on one particular table row or figure can
+  be missed, and keyword search alongside vector search would help there.
+- The `sources` list always shows the 4 retrieved chunks, even when the answer is a refusal. That
+  is useful when debugging but it does mean a refusal still returns text.
+- There is no conversation memory, so a follow up like "and what about healthcare?" has no
+  context. The UI keeps the conversation on screen but the API is stateless.
+- Answers are not streamed. The whole reply appears after the typing indicator. Simpler than a
+  streaming endpoint and good enough at this document size.
+- There is no evaluation set. Answer quality is judged by reading, not measured against ground
+  truth.
+
+---
+
+## deploy
+
+It runs on Render as a **native Python service, with no Dockerfile**, because `frontend/dist` is
+committed and FastAPI serves the UI from the same process. `render.yaml` in the repo root
+describes the whole service and `.python-version` pins Python 3.12.
+
+**Live:** https://agentic-ai-rag-chatbot-tc3p.onrender.com
+
+To deploy your own copy:
+
+1. Push the repo to GitHub.
+2. In Render choose **New**, then **Blueprint**, then pick the repository. Render reads
+   `render.yaml` from it.
+3. Render asks for the two secrets. Paste them into the dashboard, they are never stored in git:
+   `PINECONE_API_KEY` and `GROQ_API_KEY`. `PINECONE_INDEX_NAME` and `GROQ_MODEL` are already set
+   in the blueprint.
+4. Deploy. The log should end with `Application startup complete`.
+
+`/health` is wired up as Render's health check, so the service is only marked live once the API
+answers.
+
+A few things worth knowing about the deployed service:
+
+- **Nothing is ingested at deploy time.** The 113 chunks already live in the Pinecone index. If
+  you ever change the embedding model or the chunk size, run `python scripts/ingest.py --rebuild`
+  locally first.
+- **It needs about 300 MB of RAM** after the first query, because the embedding model runs
+  locally. Render's free tier has 512 MB, which fits with room to spare.
+- **The first request is slow.** The model downloads and loads on first use, so the first answer
+  can take 15 to 30 seconds. `/health` responds straight away.
+- **The free tier sleeps** after about 15 minutes with no traffic, and the next request pays that
+  cold start again. If you want it to stay warm for a demo or an interview, change `plan` to
+  `starter` in `render.yaml`, which is $7 a month.
+
+---
+
+## how to explain this in an interview
+
+**what is RAG?**
+
+Retrieval Augmented Generation. Instead of asking a model to answer from memory, we look up the
+relevant pieces of our document first and paste them into the prompt. The model then answers out
+of those pieces. It lets a general model answer about one specific book, and it lets us show the
 source of every claim.
 
-**Why do we need embeddings?**
-Because keyword search only matches identical words. A user asking about "the cost of an agent"
-would not match a paragraph that says "how much does an agent cost?". Embeddings convert text
-into a vector of numbers that captures *meaning*, so those two are recognised as similar even
-though the words differ.
+**why do we need embeddings?**
 
-**Why use a vector database?**
-A vector database stores those vectors and, crucially, can search *millions* of them quickly by
-finding nearest neighbours. Comparing a question against 113 chunks by hand is trivial; doing it
-against a whole document library is not. Pinecone does that nearest-neighbour search and returns
-the closest chunks with their similarity scores.
+Because keyword search only matches identical words. Somebody asking about "the cost of an agent"
+would not match a paragraph that says "how much does an agent cost". Embeddings turn text into a
+list of numbers that captures meaning, so those two are recognised as close even though the words
+differ.
 
-**What happens when a user asks a question?**
-Four steps. (1) FastAPI validates the question. (2) The question is embedded into a vector.
-(3) Pinecone returns the 4 chunks whose vectors are most similar. (4) Those chunks plus the
-question go to the LLM, which answers using only that context, and we return the answer with the
-chunks and the score.
+**why use a vector database?**
 
-**Why use LangGraph?**
-It makes the pipeline an explicit graph — nodes and edges — instead of a chain of function calls.
-Here it is `START → retrieve → generate → END`, which describes any RAG system, but as the
-pipeline grows (re-ranking, query rewriting, a self-critique step, a "not found" branch) the
-graph gives you branching, loops and state passing for free rather than as nested `if`
-statements. It also makes the pipeline inspectable — you can print the state after each node.
+Because it can search a lot of vectors quickly. Comparing a question against 113 chunks by hand is
+fine. Doing it against a whole library of documents is not. A vector database stores the vectors
+and finds the nearest neighbours for you, returning the closest chunks along with their scores.
 
-**How does the chatbot stay grounded?**
-Three things. The LLM is only ever shown retrieved chunks, never the raw question on its own. The
-system prompt explicitly forbids outside knowledge and prescribes the exact refusal sentence. And
-the retrieval threshold means low-relevance questions never reach the LLM at all. The returned
-`sources` let a user verify the grounding themselves.
+**what happens when someone asks a question?**
 
-**What does the Pinecone similarity score mean?**
-It is the cosine similarity between the question's vector and a chunk's vector, between -1 and 1,
-where 1 means "pointing in exactly the same direction" and 0 means "unrelated". It measures how
-*semantically close* the text is, not how *correct* the answer is. So `confidence: 0.81` means
-"this chunk looks like a good match for the question" — a retrieval-quality signal, not a
+Four steps. FastAPI checks the question is not empty. The question gets embedded into a vector.
+Pinecone returns the 4 chunks closest to that vector. Those chunks plus the question go to the
+model, and we send back the answer with the chunks and the score.
+
+**why use LangGraph?**
+
+It makes the pipeline an explicit graph of nodes and edges rather than a chain of function calls.
+Here it is `START`, `retrieve`, `generate`, `END`, which describes any RAG system at all. The value
+shows up as the pipeline grows. Query rewriting, re-ranking, a self critique step, a not found
+branch, each of those is a node and an edge, instead of another level of nested `if` statements.
+It also makes debugging easy, because you can print the state after each node.
+
+**how does the chatbot stay grounded?**
+
+Three things. The model only ever sees retrieved chunks, never the raw question on its own. The
+system prompt explicitly forbids outside knowledge and tells it exactly what to say when the
+context is not enough. And the threshold means a low scoring question never reaches the model at
+all. The sources we return let the user check the grounding themselves.
+
+**what does the Pinecone similarity score mean?**
+
+It is the cosine similarity between the question's vector and a chunk's vector, between minus 1
+and 1, where 1 means pointing in exactly the same direction and 0 means unrelated. It measures
+how semantically close two pieces of text are, not how correct the answer is. So 0.81 means this
+chunk looks like a good match for the question. It is a retrieval quality signal, not a
 probability of correctness.
 
-**What happens when the answer isn't in the PDF?**
-Retrieval still runs, but the best score comes back low. In the `generate` node we compare it to
-the threshold and, if it is below, return "I couldn't find this information in the provided
-ebook" with that low score — and skip the LLM call entirely. Even if the threshold were passed by
-accident, the system prompt tells the model to refuse when the context is insufficient.
+**what happens when the answer is not in the pdf?**
 
-**Why did we choose the chunk size?**
-1000 characters is roughly 150–200 words: small enough that several chunks fit in the prompt,
-large enough to hold a complete thought or paragraph. The 150-character overlap means a sentence
-that straddles a boundary still appears whole in one of the two chunks. This document is only
-~78,000 characters, giving 113 chunks — a small index that retrieval handles comfortably.
+Retrieval still runs, but the best score comes back low. In the `generate` node we compare it
+against the threshold, and if it is below we return "I couldn't find this information in the
+provided ebook" along with that low score, and we never call the model. Even if something slipped
+past the threshold, the system prompt tells the model to refuse when the context is not enough.
 
-**Why did we choose these providers?**
-Groq gives a fast, free, OpenAI-compatible chat endpoint, so generation costs nothing and reuses
-the standard SDK. For embeddings, Groq has no embeddings API, and we did not want a second paid
-provider for 113 chunks, so we run a small sentence-transformers model locally. It is free,
-private and good enough for a 113-chunk corpus.
+**why did we choose that chunk size?**
 
-**Why React, and why nothing else in the frontend?**
-React was explicitly allowed by the brief and it makes the state — the message list, what is
-being typed, whether a request is in flight — obvious in one `useState` hook per piece of state.
-Beyond that I used nothing: no UI framework, no data-fetching library, no state manager, so the
-entire frontend is `fetch` plus JSX. `api.js` is 20 lines and its request body matches the
-FastAPI model one to one.
+1000 characters is roughly 150 to 200 words. Small enough that several chunks fit in the prompt,
+large enough to hold a whole paragraph or a complete thought. The 150 character overlap means a
+sentence sitting across a boundary still appears whole in one of the two neighbouring chunks. The
+book is about 78,000 characters, which gives 113 chunks, a small enough index that retrieval
+handles without any trouble.
 
-**How do the two halves talk to each other?**
-The React app sends `POST /chat` and gets back `{answer, confidence, sources}`. In development
-Vite proxies those two paths to port 8000 so the browser stays on one origin and the API needs no
-CORS configuration; in production FastAPI serves the built React bundle itself, so it is all one
-process. Nothing else crosses the boundary — the UI holds the transcript in memory and never
-sends it back.
+**why did we choose these providers?**
 
-**What are the limitations of this implementation?**
-The threshold and chunk size are hand-tuned for this one book and would need re-measuring for
-another. Retrieval is purely semantic, so a question that needs a specific table row can be
-missed; hybrid search would help. There is no conversation memory, so follow-up questions have no
-context. There is no evaluation set, so answer quality is assessed by reading. And the LLM can
-still be over-verbose or paraphrase tightly — the grounding is enforced, the prose is not.
+Groq gives a fast, free, OpenAI compatible chat endpoint, so generation costs nothing and reuses
+the standard SDK. Groq has no embeddings endpoint, and needing a second paid provider for 113
+chunks did not seem worth it, so the embedding model runs locally instead. Free, private, and good
+enough for an index this size.
+
+**why React, and nothing else in the frontend?**
+
+React was allowed by the brief, and it makes the state obvious. The message list, what is being
+typed, whether a request is in flight, one `useState` each. Beyond that I used no libraries at
+all, so the whole frontend is `fetch` plus jsx. `api.js` is 37 lines and its request body
+matches the FastAPI model exactly.
+
+**what are the limitations?**
+
+The threshold and chunk size are tuned for this one book and would need re measuring elsewhere.
+Retrieval is purely semantic, so a question that needs one specific table row can be missed.
+There is no conversation memory, so follow up questions have no context. There is no evaluation
+set, so quality is judged by reading. And the model can still be over verbose or paraphrase too
+tightly. The grounding is enforced, the prose is not.
 
 ---
 
-## License
+## license
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
