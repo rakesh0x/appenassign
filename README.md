@@ -260,6 +260,65 @@ useful for a reviewer who only wants to run the Python side.
 
 ---
 
+## 7b. Deploy to Render
+
+Render runs this as a **native Python service — no Dockerfile needed**, because `frontend/dist`
+is committed and FastAPI serves the UI from the same process. The repository already contains
+[`render.yaml`](render.yaml), which describes the service, and [`.python-version`](.python-version)
+pins Python 3.12.
+
+**One-time setup**
+
+1. Push the repo to GitHub.
+2. In Render: **New → Blueprint**, then pick the repository. Render reads `render.yaml`.
+3. Render will prompt for the two secrets it must not store in git. Paste them in the dashboard:
+
+   | Key | Value |
+   |---|---|
+   | `PINECONE_API_KEY` | your Pinecone key |
+   | `GROQ_API_KEY` | your Groq key |
+
+   `PINECONE_INDEX_NAME` and `GROQ_MODEL` are already set in the blueprint.
+4. Deploy. The build log should end with `Application startup complete`.
+
+Then open the `*.onrender.com` URL. `GET /health` is wired up as Render's health check, so the
+service is only marked live once the API answers.
+
+**What the deployed service does and does not do**
+
+- **No ingestion at deploy time.** The 113 chunks already live in the Pinecone index
+  `agentic-ai-ebook`. If you ever change the embedding model or the chunk size, re-run
+  `python scripts/ingest.py --rebuild` locally — the deploy only reads what is already in Pinecone.
+- **Memory.** The service needs roughly 300 MB of RAM after the first query, because the MiniLM
+  embedding model is loaded locally. Render's free tier has 512 MB, which fits with room to spare.
+- **The first request is slow.** The embedding model downloads (~90 MB) and loads on first use, so
+  the first answer can take 15–30 seconds. `/health` responds immediately.
+- **The free tier sleeps.** After ~15 minutes with no traffic Render stops the instance, and the
+  next request pays that cold start again. If you would rather it stay warm for a demo or an
+  interview, switch the plan to `starter` in `render.yaml` (or the Render dashboard) for $7/month.
+
+**Deploying from the command line instead**
+
+Render has no first-party CLI. Use the official API with a key from <https://api.render.com>:
+
+```bash
+curl -X POST https://api.render.com/v1/services \
+  -H "Authorization: Bearer $RENDER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"agentic-ai-rag-chatbot","githubRepo":"<you>/<repo>"}'
+```
+
+Or use the community CLI, `render-cli`:
+
+```bash
+brew install cli/cli
+render services create --name agentic-ai-rag-chatbot --repo <you>/<repo>
+```
+
+Then set `PINECONE_API_KEY` and `GROQ_API_KEY` on the service and trigger a deploy.
+
+---
+
 ## 8. Example requests
 
 `GET /health`
@@ -407,6 +466,8 @@ rag-chatbot/
 ├── data/                         where the downloaded PDF lands (git-ignored)
 ├── .env.example                  template for the environment variables
 ├── .gitignore
+├── render.yaml                   Render service definition (native Python, no Dockerfile)
+├── .python-version               pins Python 3.12
 ├── requirements.txt              pinned Python versions
 ├── frontend/package.json         pinned JS versions
 └── README.md
