@@ -1,0 +1,12 @@
+fastapi==0.141.1
+uvicorn[standard]==0.54.0
+pydantic==2.13.5
+langgraph==1.2.12
+openai==3.20.0
+pinecone==10.0.0
+fastembed==0.8.1
+pymupdf==1.28.2
+requests==2.34.2
+python-dotenv==1.2.3
+pytest==9.1.1
+httpx==0.28.1
